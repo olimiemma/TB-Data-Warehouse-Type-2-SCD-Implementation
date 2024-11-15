@@ -1,0 +1,114 @@
+-- Clean up existing structures
+DROP TABLE IF EXISTS tb_dw.tb_fact;
+DROP TABLE IF EXISTS tb_dw.country_dim;
+DROP VIEW IF EXISTS tb_dw.v_country_dim_current;
+
+-- Create new country dimension with SCD Type 2 structure
+CREATE TABLE tb_dw.country_dim (
+    surrogate_key serial PRIMARY KEY,
+    country_code char(2),
+    country_name varchar(100),
+    effective_start_date date,
+    effective_end_date date,
+    is_current boolean
+);
+
+-- Insert initial country data
+INSERT INTO tb_dw.country_dim 
+(country_name, country_code, effective_start_date, effective_end_date, is_current)
+SELECT 
+    country_name,
+    'NA',
+    '1900-01-01',
+    '9999-12-31',
+    true
+FROM (SELECT DISTINCT country as country_name FROM tb) c;
+
+-- Update specific country codes and historical changes
+-- Zaire/DR Congo
+UPDATE tb_dw.country_dim
+SET country_code = 'CD',
+    effective_end_date = '1997-05-16',
+    is_current = false
+WHERE country_name = 'Zaire';
+
+INSERT INTO tb_dw.country_dim 
+(country_name, country_code, effective_start_date, effective_end_date, is_current)
+VALUES 
+('Democratic Republic of the Congo', 'CD', '1997-05-17', '9999-12-31', true);
+
+-- Swaziland/Eswatini
+UPDATE tb_dw.country_dim
+SET country_code = 'SZ',
+    effective_end_date = '2008-12-31',
+    is_current = false
+WHERE country_name = 'Swaziland';
+
+INSERT INTO tb_dw.country_dim 
+(country_name, country_code, effective_start_date, effective_end_date, is_current)
+VALUES 
+('Eswatini', 'SZ', '2009-01-01', '9999-12-31', true);
+
+-- Create view for current names
+CREATE OR REPLACE VIEW tb_dw.v_country_dim_current AS
+SELECT surrogate_key as country_id, country_name
+FROM tb_dw.country_dim
+WHERE is_current = true;
+
+-- Create fact table with temporal integrity
+CREATE TABLE tb_dw.tb_fact (
+    country_id int REFERENCES tb_dw.country_dim(surrogate_key),
+    year_id int REFERENCES tb_dw.year_dim(year_id),
+    gender_id int REFERENCES tb_dw.gender_dim(gender_id),
+    child_disease_amt int,
+    adult_disease_amt int,
+    elderly_disease_amt int,
+    PRIMARY KEY (country_id, year_id, gender_id)
+);
+
+-- Load fact data with correct historical references
+INSERT INTO tb_dw.tb_fact
+SELECT 
+    CASE 
+        WHEN t.year >= 2009 AND c.country_name = 'Swaziland' THEN 
+            (SELECT surrogate_key FROM tb_dw.country_dim WHERE country_name = 'Eswatini')
+        WHEN t.year >= 1997 AND c.country_name = 'Zaire' THEN 
+            (SELECT surrogate_key FROM tb_dw.country_dim WHERE country_name = 'Democratic Republic of the Congo')
+        ELSE c.surrogate_key 
+    END as country_id,
+    y.year_id,
+    g.gender_id,
+    t.child,
+    t.adult,
+    t.elderly
+FROM tb t
+JOIN tb_dw.country_dim c ON t.country = c.country_name
+JOIN tb_dw.year_dim y ON t.year = y.year_value
+JOIN tb_dw.gender_dim g ON LOWER(t.sex) = LOWER(g.gender_desc);
+
+-- Create indexes for performance
+CREATE INDEX idx_country_dim_current ON tb_dw.country_dim(is_current) WHERE is_current = true;
+CREATE INDEX idx_country_dim_dates ON tb_dw.country_dim(effective_start_date, effective_end_date);
+CREATE INDEX idx_fact_temporal ON tb_dw.tb_fact(country_id, year_id);
+
+-- Verification query
+SELECT 
+    cd.country_name,
+    cd.country_code,
+    cd.effective_start_date,
+    cd.effective_end_date,
+    cd.is_current,
+    y.year_value,
+    COUNT(*) as fact_count
+FROM tb_dw.country_dim cd
+LEFT JOIN tb_dw.tb_fact f ON cd.surrogate_key = f.country_id
+LEFT JOIN tb_dw.year_dim y ON f.year_id = y.year_id
+WHERE cd.country_code IN ('CD', 'SZ')
+GROUP BY 
+    cd.country_name,
+    cd.country_code,
+    cd.effective_start_date,
+    cd.effective_end_date,
+    cd.is_current,
+    y.year_value
+ORDER BY cd.country_code, y.year_value;
